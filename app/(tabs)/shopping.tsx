@@ -99,6 +99,7 @@ export default function ShoppingScreen() {
                     onPress={() => toggle(item.id)}
                     accessibilityRole="checkbox"
                     accessibilityState={{ checked: done }}
+                    aria-checked={done}
                     accessibilityLabel={`${item.name}，${formatQuantity(item)}${done ? "，已购买" : "，未购买"}`}
                     style={{ minHeight: 53, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 13, borderTopWidth: index ? 1 : 0, borderTopColor: brand.paperDeep }}
                   >
@@ -114,7 +115,7 @@ export default function ShoppingScreen() {
           );
         })}
 
-        {items.length > 0 && <View style={{ alignItems: "center", paddingTop: 4, paddingBottom: 12 }}><Text style={{ color: brand.muted, fontSize: 10 }}>清单随本周计划自动更新 · 勾选状态保存在本机</Text></View>}
+        {items.length > 0 && <View style={{ alignItems: "center", paddingTop: 4, paddingBottom: 12 }}><Text style={{ color: brand.muted, fontSize: 10 }}>清单随本周计划自动更新 · 保存状态见顶部</Text></View>}
       </ScrollView>
     </AppFrame>
   );

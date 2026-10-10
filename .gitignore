@@ -72,3 +72,4 @@ Thumbs.db
 !.env.example
 !.env.sample
 *:Zone.Identifier
+.vercel

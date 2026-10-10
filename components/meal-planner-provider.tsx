@@ -1,24 +1,21 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { AppState, Platform } from "react-native";
 
 import { dateKey, getWeekDates } from "@/lib/dates";
 import type { MealType } from "@/lib/recipes";
-import type { WeeklyPlan } from "@/lib/shopping-list";
-
-const STORAGE_KEY = "@yizhouhaoshi/planner-v1";
-
-type PersistedState = {
-  plan: WeeklyPlan;
-  checked: Record<string, boolean>;
-};
-type StateUpdater = (current: PersistedState) => PersistedState;
-
-const EMPTY_STATE: PersistedState = { plan: {}, checked: {} };
+import { cloudStorageScope } from "@/lib/supabase";
+import { plannerRemote } from "@/lib/planner-cloud";
+import { GUEST_STORAGE_KEY, PlannerStore, type PlannerView } from "@/lib/planner-store";
+import { useCloudAccount } from "./cloud-account-provider";
 
 type PlannerContextValue = {
   ready: boolean;
-  plan: WeeklyPlan;
-  checked: Record<string, boolean>;
+  plan: PlannerView["state"]["plan"];
+  checked: PlannerView["state"]["checked"];
+  syncStatus: PlannerView["status"];
+  syncMessage: string;
+  pendingCount: number;
   weekOffset: number;
   selectedDate: string;
   weekDates: ReturnType<typeof getWeekDates>;
@@ -27,107 +24,86 @@ type PlannerContextValue = {
   assignRecipe: (date: string, meal: MealType, recipeId: string) => void;
   removeRecipe: (date: string, meal: MealType) => void;
   toggleChecked: (itemId: string) => void;
+  sync: () => Promise<void>;
+  keepLocal: () => Promise<void>;
+  useCloud: () => Promise<void>;
+  importGuest: () => Promise<number>;
+  flush: () => Promise<void>;
 };
 
 const PlannerContext = createContext<PlannerContextValue | null>(null);
 
 export function MealPlannerProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<PersistedState>(EMPTY_STATE);
-  const stateRef = useRef<PersistedState>(EMPTY_STATE);
-  const pendingUpdatesRef = useRef<StateUpdater[]>([]);
-  const [ready, setReady] = useState(false);
+  const { session } = useCloudAccount();
+  const accountId = session?.user.id;
+  // Remount on account changes: one user's cache and pending writes never enter
+  // another user's view. The database RPC independently checks the account ID.
+  return <PlannerSession key={accountId ?? "guest"} accountId={accountId}>{children}</PlannerSession>;
+}
+
+function PlannerSession({ children, accountId }: { children: React.ReactNode; accountId?: string }) {
+  const [store] = useState(() => new PlannerStore(
+    AsyncStorage,
+    accountId ? `@yizhouhaoshi/account:${cloudStorageScope}:${accountId}` : GUEST_STORAGE_KEY,
+    accountId ? plannerRemote(accountId) : undefined,
+  ));
+  const [view, setView] = useState(store.getSnapshot);
   const [weekOffset, setWeekOffset] = useState(0);
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
 
   useEffect(() => {
-    let active = true;
-    let restored = EMPTY_STATE;
-    AsyncStorage.getItem(STORAGE_KEY)
-      .then((saved) => {
-        if (!saved) return;
-        const parsed = JSON.parse(saved) as Partial<PersistedState>;
-        restored = {
-          plan: parsed.plan && typeof parsed.plan === "object" ? parsed.plan : {},
-          checked: parsed.checked && typeof parsed.checked === "object" ? parsed.checked : {},
-        };
-      })
-      .catch(() => {
-        // A missing or invalid local snapshot should never block planning.
-      })
-      .finally(() => {
-        if (!active) return;
-        const queued = pendingUpdatesRef.current;
-        pendingUpdatesRef.current = [];
-        const next = queued.reduce((current, updater) => updater(current), restored);
-        stateRef.current = next;
-        setState(next);
-        if (queued.length) void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
-        setReady(true);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const update = useCallback((updater: StateUpdater) => {
-    if (!ready) {
-      pendingUpdatesRef.current.push(updater);
-      return;
+    store.start();
+    const unsubscribe = store.subscribe(() => setView(store.getSnapshot()));
+    void store.initialize().then(() => { if (accountId) void store.sync(); });
+    const poll = accountId ? setInterval(() => {
+      if (Platform.OS === "web" ? document.visibilityState === "visible" : AppState.currentState === "active") {
+        void store.sync();
+      }
+    }, 30000) : undefined;
+    const refresh = () => { if (accountId) void store.sync(); };
+    const active = AppState.addEventListener("change", (state) => { if (state === "active") refresh(); });
+    if (Platform.OS === "web") {
+      window.addEventListener("online", refresh);
+      window.addEventListener("focus", refresh);
     }
-    const next = updater(stateRef.current);
-    stateRef.current = next;
-    setState(next);
-    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
-  }, [ready]);
+    return () => {
+      unsubscribe();
+      clearInterval(poll);
+      active.remove();
+      if (Platform.OS === "web") {
+        window.removeEventListener("online", refresh);
+        window.removeEventListener("focus", refresh);
+      }
+      store.dispose();
+    };
+  }, [accountId, store]);
 
   const shiftWeek = useCallback((amount: number) => {
-    const nextOffset = weekOffset + amount;
-    setWeekOffset(nextOffset);
-    setSelectedDate(getWeekDates(nextOffset)[0].key);
+    const next = weekOffset + amount;
+    setWeekOffset(next);
+    setSelectedDate(getWeekDates(next)[0].key);
   }, [weekOffset]);
-
   const assignRecipe = useCallback((date: string, meal: MealType, recipeId: string) => {
-    update((current) => ({
-      ...current,
-      plan: {
-        ...current.plan,
-        [date]: { ...current.plan[date], [meal]: recipeId },
-      },
-    }));
-  }, [update]);
-
+    const before = store.getSnapshot().state.plan[date]?.[meal] ?? null;
+    store.edit({ kind: "meal", date, meal, before, after: recipeId });
+  }, [store]);
   const removeRecipe = useCallback((date: string, meal: MealType) => {
-    update((current) => {
-      const day = { ...current.plan[date] };
-      delete day[meal];
-      const plan = { ...current.plan };
-      if (Object.keys(day).length) plan[date] = day;
-      else delete plan[date];
-      return { ...current, plan };
-    });
-  }, [update]);
-
-  const toggleChecked = useCallback((itemId: string) => {
-    update((current) => ({
-      ...current,
-      checked: { ...current.checked, [itemId]: !current.checked[itemId] },
-    }));
-  }, [update]);
+    const before = store.getSnapshot().state.plan[date]?.[meal] ?? null;
+    store.edit({ kind: "meal", date, meal, before, after: null });
+  }, [store]);
+  const toggleChecked = useCallback((id: string) => {
+    const before = store.getSnapshot().state.checked[id] ?? false;
+    store.edit({ kind: "check", id, before, after: !before });
+  }, [store]);
 
   const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
   const value = useMemo<PlannerContextValue>(() => ({
-    ready,
-    plan: state.plan,
-    checked: state.checked,
-    weekOffset,
-    selectedDate,
-    weekDates,
-    setSelectedDate,
-    shiftWeek,
-    assignRecipe,
-    removeRecipe,
-    toggleChecked,
-  }), [ready, state, weekOffset, selectedDate, weekDates, shiftWeek, assignRecipe, removeRecipe, toggleChecked]);
+    ready: view.ready, plan: view.state.plan, checked: view.state.checked,
+    syncStatus: view.status, syncMessage: view.message, pendingCount: view.pendingCount,
+    weekOffset, selectedDate, weekDates, setSelectedDate, shiftWeek, assignRecipe, removeRecipe, toggleChecked,
+    sync: () => store.sync(), keepLocal: () => store.sync(true), useCloud: store.useCloud,
+    importGuest: store.importGuest, flush: store.flush,
+  }), [view, weekOffset, selectedDate, weekDates, shiftWeek, assignRecipe, removeRecipe, toggleChecked, store]);
 
   return <PlannerContext.Provider value={value}>{children}</PlannerContext.Provider>;
 }
